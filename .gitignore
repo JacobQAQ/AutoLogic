@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Runtime outputs
+logicrag_outputs*/
+tmp_query_processing_test/
+generated_report.md
+generated_node_outputs.json
+generation_trace.json
+retrieved_materials/
+futures_data_*.csv
+
+# Local datasets are kept outside source control by default.
+dataset/
+test/
+
+# Local credentials / environment files
+.env
+*.env
+secrets.json
+credentials.json
+
+# Large or regenerated data artifacts
+*.log
