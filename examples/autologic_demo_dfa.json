@@ -1,0 +1,161 @@
+{
+  "schema_version": "1.0",
+  "dfa_id": "autologic_keyless_demo",
+  "collection_id": "autologic_demo_fixture",
+  "description": "Fully offline condition-driven AutoLogic demo DFA.",
+  "alphabet": [
+    "COMPLETE",
+    "NO_MATCH",
+    "PRICE_DOWN",
+    "PRICE_UP"
+  ],
+  "implicit_rejection_state": "s_bottom",
+  "initial_state": "S001",
+  "final_states": [
+    "S005"
+  ],
+  "states": [
+    {
+      "state_id": "S001",
+      "state_kind": "writing",
+      "label": "start",
+      "description": "Introduce the weekly market report scope.",
+      "action": "Write a concise opening for the weekly market report.",
+      "required_materials": [],
+      "support_count": 1,
+      "support_documents": ["demo-history"],
+      "is_initial": true,
+      "is_final": false
+    },
+    {
+      "state_id": "S002",
+      "state_kind": "writing",
+      "label": "market_review",
+      "description": "Review current market price direction from retrieved evidence.",
+      "action": "Review the observed market price movement.",
+      "required_materials": ["COMEX gold price and change ratio"],
+      "support_count": 1,
+      "support_documents": ["demo-history"],
+      "is_initial": false,
+      "is_final": false
+    },
+    {
+      "state_id": "S003",
+      "state_kind": "writing",
+      "label": "bullish_analysis",
+      "description": "Explain the implications of supported upward price evidence.",
+      "action": "Write a bullish analysis grounded in the observed price increase.",
+      "required_materials": [],
+      "support_count": 1,
+      "support_documents": ["demo-history"],
+      "is_initial": false,
+      "is_final": false
+    },
+    {
+      "state_id": "S004",
+      "state_kind": "writing",
+      "label": "bearish_analysis",
+      "description": "Explain the implications of supported downward price evidence.",
+      "action": "Write a bearish analysis grounded in the observed price decrease.",
+      "required_materials": [],
+      "support_count": 1,
+      "support_documents": ["demo-history"],
+      "is_initial": false,
+      "is_final": false
+    },
+    {
+      "state_id": "S005",
+      "state_kind": "writing",
+      "label": "risk_warning",
+      "description": "Conclude with a concise risk warning.",
+      "action": "Write a risk warning without inventing unsupported facts.",
+      "required_materials": [],
+      "support_count": 1,
+      "support_documents": ["demo-history"],
+      "is_initial": false,
+      "is_final": true
+    }
+  ],
+  "transitions": [
+    {
+      "source": "S001",
+      "symbol": "COMPLETE",
+      "condition_description": "The opening writing action is complete.",
+      "target": "S002",
+      "support_count": 1,
+      "confidence": 1.0,
+      "support_examples": [],
+      "metadata": {"unconditional": true}
+    },
+    {
+      "source": "S002",
+      "symbol": "PRICE_UP",
+      "condition_description": "Current evidence shows that price is increasing.",
+      "target": "S003",
+      "support_count": 1,
+      "confidence": 1.0,
+      "support_examples": []
+    },
+    {
+      "source": "S002",
+      "symbol": "PRICE_DOWN",
+      "condition_description": "Current evidence shows that price is decreasing.",
+      "target": "S004",
+      "support_count": 1,
+      "confidence": 1.0,
+      "support_examples": []
+    },
+    {
+      "source": "S003",
+      "symbol": "COMPLETE",
+      "condition_description": "The bullish analysis writing action is complete.",
+      "target": "S005",
+      "support_count": 1,
+      "confidence": 1.0,
+      "support_examples": [],
+      "metadata": {"unconditional": true}
+    },
+    {
+      "source": "S004",
+      "symbol": "COMPLETE",
+      "condition_description": "The bearish analysis writing action is complete.",
+      "target": "S005",
+      "support_count": 1,
+      "confidence": 1.0,
+      "support_examples": [],
+      "metadata": {"unconditional": true}
+    }
+  ],
+  "build_config": {
+    "semantic_merge_threshold": 0.85,
+    "state_support_threshold": 0.5,
+    "transition_support_threshold": 0.5,
+    "chat_model": "offline-fixture",
+    "embedding_model": "offline-fixture",
+    "max_support_examples": 0
+  },
+  "construction_metadata": {
+    "source_documents": ["demo-history"],
+    "source_document_count": 1,
+    "state_provenance": {
+      "S001": [{"source_report_id": "demo-history", "source_node_id": "start", "ancestor_chain": [], "source_position": 0, "source_excerpt": "Fixture opening."}],
+      "S002": [{"source_report_id": "demo-history", "source_node_id": "market_review", "ancestor_chain": [], "source_position": 1, "source_excerpt": "Fixture market review."}],
+      "S003": [{"source_report_id": "demo-history", "source_node_id": "bullish_analysis", "ancestor_chain": [], "source_position": 2, "source_excerpt": "Fixture bullish branch."}],
+      "S004": [{"source_report_id": "demo-history", "source_node_id": "bearish_analysis", "ancestor_chain": [], "source_position": 2, "source_excerpt": "Fixture bearish branch."}],
+      "S005": [{"source_report_id": "demo-history", "source_node_id": "risk_warning", "ancestor_chain": [], "source_position": 3, "source_excerpt": "Fixture risk warning."}]
+    },
+    "symbol_catalog": {
+      "COMPLETE": "Unconditional completion of the current writing action.",
+      "PRICE_UP": "Current evidence shows a positive price change.",
+      "PRICE_DOWN": "Current evidence shows a negative price change."
+    },
+    "determinism_conflicts": [],
+    "dropped_states": [],
+    "dropped_transitions": [],
+    "single_successor_unconditional_assumptions": [
+      {"source": "S001", "target": "S002", "support_count": 1, "reason": "Demo fixture unconditional edge."},
+      {"source": "S003", "target": "S005", "support_count": 1, "reason": "Demo fixture unconditional edge."},
+      {"source": "S004", "target": "S005", "support_count": 1, "reason": "Demo fixture unconditional edge."}
+    ]
+  }
+}

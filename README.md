@@ -1,151 +1,185 @@
-# LogicRAG
+# AutoLogic
 
-Logic-Driven Retrieval-Augmented Generation for Financial Document Generation
+AutoLogic is a minimal research prototype for condition-driven financial report generation. It learns one deterministic finite automaton (DFA) from two homogeneous historical reports and executes that DFA state by state using current evidence.
 
----
+This anonymous repository does not contain API keys, account credentials, personal filesystem paths, or user-specific configuration.
 
-## Overview
+## Method
 
-Generating domain-specific documents requires not only retrieving relevant facts, but also following the reusable writing logic that governs how professional reports are organized. This is especially important for financial research report generation, where the generated document must respect institution-specific section order, data usage patterns, and discourse conventions.
+Each executable DFA state is an atomic writing action learned from a leaf node in a historical report. Internal root/child nodes remain construction metadata and are not flattened into the runtime path.
 
-To address this challenge, we introduce a new problem named **Logic-Driven Document Generation Problem (LDP)**, where the generated document should be consistent with the writing paradigm of sample documents while accurately grounding numerical values in external data sources. To solve LDP, we propose **LogicRAG**, which represents reusable writing logic in historical documents as a deterministic finite automaton (DFA). Each state corresponds to a discourse segment with a stable semantic function, and state transitions describe the organizational order among these segments. During generation, LogicRAG extracts a task-specific sub-automaton according to the user query, retrieves the required state-level data, and generates the final report state by state.
+At runtime AutoLogic repeatedly:
 
-We further construct and release **FinLDP-Bench**, a financial benchmark dataset for logic-driven document generation. FinLDP-Bench covers five representative categories of financial analyst reports and supports systematic evaluation of logic consistency, data sufficiency, and numerical accuracy.
+1. loads the current state;
+2. retrieves only that state's required materials;
+3. generates only that state's content;
+4. grounds one finite outgoing condition symbol;
+5. calls `delta(current_state, symbol)`;
+6. continues until a final state or controlled termination.
 
----
+The query specifies topic, date, scope, and global writing requirements. It does not precompute the report path. AutoLogic does not create a query subtree or SubDFA and does not perform FAISS query-state matching.
 
-## 1. Motivation
+Undefined `(state, symbol)` pairs map implicitly to the rejection state `s_bottom`. Runtime guards bound steps, state visits, and repeated transitions while preserving partial outputs.
 
-Domain-specific document generation requires not only retrieving relevant facts but also strictly following the writing logic of a specific institution. Financial research report generation is a typical example of this challenge. For example, when the user query is **write a precious metals research report for February 28, 2025**, the system must determine which market indicators should be used, how the report sections should be ordered, and how adjacent paragraphs should maintain coherent analysis.
+## Repository layout
 
-Traditional RAG methods often fail because they mainly retrieve content based on semantic similarity. They may find locally relevant facts, but still miss the institution-specific writing order, omit required data fields, or mix evidence from inconsistent time ranges. This motivates the Logic-Driven Document Generation Problem and the development of LogicRAG.
+```text
+autologic/
+    models.py
+    validation.py
+    condition_induction.py
+    dfa_builder.py
+    adapters.py
+    executor.py
 
-![LogicRAG motivation and overview](images/introduction.png)
+autologic_client.py
+document_learner.py
+ifind_data_plugin.py
+report_generator.py
+domain_dictionary.csv
 
-Figure 1: Motivation of logic-driven financial document generation.
+examples/
+    autologic_demo_dfa.json
+    autologic_demo_materials.json
 
----
+docs/
+    AUTOLOGIC_DESIGN.md
+    AUTOLOGIC_REUSE_MAP.md
+    AUTOLOGIC_DEMO.md
+    EXPERIMENT_GUIDE.md
+```
 
-## 2. Method
+The minimal repository retains only the support modules directly reused by AutoLogic. It does not depend on the legacy query-processing or LogicRAG client pipeline.
 
-LogicRAG is a logic-driven RAG framework that transforms document generation from content-centric retrieval into writing-logic-based matching and execution.
+## Requirements
 
-The framework consists of three stages:
+The observed core Python dependencies are:
 
-1. **Document Logic Extraction**  
-   LogicRAG extracts state sequences from sample documents, identifies reusable discourse states shared across reports, and constructs a global DFA that represents the institution-specific writing logic.
+```text
+openai
+pandas
+numpy
+```
 
-2. **Query Processing**  
-   Given a user query, LogicRAG matches the query intent against the global state index, selects task-relevant states, and extracts a connected sub-automaton that covers the required writing logic.
+Install the repository-managed dependencies with:
 
-3. **Generation**  
-   LogicRAG retrieves state-level data from heterogeneous data sources, generates report segments along the transition order of the sub-automaton, and passes a brief summary between adjacent states to maintain local coherence without accumulating the full generation history.
+```text
+python -m pip install -r requirements.txt
+```
 
-![LogicRAG framework](images/overview.png)
+`numpy` is installed transitively by `pandas`.
 
-Figure 2: Overall framework of LogicRAG.
+Live iFinD retrieval additionally requires the vendor's `iFinDPy` environment. The offline demo and dry-run mode require neither credentials nor network access.
 
----
+Check imports:
 
-## 3. FinLDP-Bench
+```text
+python -c "import openai, pandas, numpy; print('core dependencies: OK')"
+python -c "import iFinDPy; print('iFinDPy: OK')"
+```
 
-**FinLDP-Bench** (Financial Logic-Driven Document Generation Benchmark) is a financial benchmark dataset for logic-driven document generation. The dataset covers five representative categories of financial analyst reports and is organized into structured records with predefined fields.
+## Credentials
 
-Detailed statistics of the FinLDP-Bench categories are shown in Table 1.
+Set credentials outside the repository using environment variables:
 
-| Subset | #Rep. | AvgTok | MaxTok | AvgF | MaxF | AvgP | Date Range | Institution |
-|---|---:|---:|---:|---:|---:|---:|---|---|
-| Agriculture | 100 | 637.1 | 884 | 64.7 | 83 | 4.00 | 2017.04-2026.01 | Pacific Securities Co., Ltd. |
-| Cotton | 80 | 291.8 | 424 | 51.7 | 88 | 4.80 | 2023.11-2026.01 | CMB Futures Co., Ltd. |
-| Macro | 25 | 354.4 | 422 | 52.8 | 64 | 6.75 | 2025.07-2026.01 | Ping An Securities Co., Ltd. |
-| Precious Metals | 150 | 397.0 | 507 | 36.1 | 55 | 3.53 | 2021.01-2025.12 | Soochow Securities Co., Ltd. |
-| ETF | 60 | 204.9 | 287 | 28.3 | 37 | 5.59 | 2024.04-2026.01 | Maigao Securities Co., Ltd. |
-| **Total** | **415** | **404.2** | **884** | **45.9** | **88** | **4.38** | **2017.04-2026.01** | -- |
+```text
+DEEPSEEK_API_KEY
+IFIND_USERNAME
+IFIND_PASSWORD
+```
 
-Table 1: Statistics of FinLDP-Bench, including the number of reports, text length, numerical-field density, paragraph count, temporal coverage, and source institution of each subset.
+Do not place credential values in CLI arguments, source files, Markdown, fixtures, manifests, or committed shell scripts. `IFIND_REFRESH_TOKEN` is not used by the current SDK adapter. `DASHSCOPE_API_KEY` is optional when API embeddings are enabled; the documented sample uses `--local-embedding-only` instead.
 
----
+## Offline quick start
 
-## 4. Main Results
+Run the keyless deterministic demo:
 
-We compare LogicRAG with representative retrieval-augmented generation methods and strong LLM baselines, including NaiveRAG, Self-RAG, ITER-RETGEN, RAG-Fusion, GraphRAG, HeteRAG, DeepSeek-V3, Qwen2.5-Max, GPT-4o, and Doubao 2.0. LogicRAG achieves the best overall performance across all evaluation metrics.
+```text
+python autologic_client.py demo --scenario price-up --output-root "autologic_outputs/demo_up" --force
+python autologic_client.py demo --scenario price-down --output-root "autologic_outputs/demo_down" --force
+```
 
-| Methods | Fluency | Consistency | ACC | BLEU-P | ROUGE-L | F1 |
-|---|---:|---:|---:|---:|---:|---:|
-| NaiveRAG | 42.5 | 42.0 | 15.3 | 17.8 | 26.1 | 21.1 |
-| Self-RAG | 50.7 | 55.8 | 20.2 | 25.1 | 31.0 | 27.7 |
-| ITER-RETGEN | 43.9 | 46.4 | 19.8 | 19.9 | 32.6 | 24.7 |
-| RAG-Fusion | 50.5 | 48.2 | 17.3 | 23.9 | 38.3 | 29.4 |
-| GraphRAG | 54.2 | 53.3 | 24.9 | 24.9 | 36.2 | 29.5 |
-| HeteRAG | 54.2 | 53.6 | 20.3 | 29.3 | 38.3 | 33.2 |
-| DeepSeek-V3 | 48.0 | 47.7 | 19.3 | 8.8 | 15.0 | 11.1 |
-| Qwen2.5-Max | 50.3 | 45.0 | 21.2 | 11.8 | 20.5 | 15.0 |
-| GPT-4o | 50.7 | 54.5 | 29.9 | 12.8 | 23.7 | 16.6 |
-| Doubao 2.0 | 47.2 | 47.5 | 17.6 | 15.4 | 23.8 | 18.7 |
-| **LogicRAG** | **54.8** | **62.0** | **72.4** | **32.3** | **41.8** | **36.4** |
-| Relative Gain | +1.1% | +11.1% | +142.1% | +10.2% | +9.1% | +9.6% |
+Expected paths:
 
-Table 2: Quantitative comparison results of different methods on the financial domain structured text generation dataset.
+```text
+price-up:   S001 -> S002 -> S003 -> S005
+price-down: S001 -> S002 -> S004 -> S005
+```
 
-To verify the generalization ability of LogicRAG, we further evaluate it on the RotoWire data-to-text generation task. We compare Direct LLM, Naive RAG, LogicRAG without DFA, and full LogicRAG. LogicRAG again achieves the best performance across all metrics.
+The query is identical in both scenarios; fixture evidence selects different symbols, demonstrating that `delta` rather than query keywords determines the path.
 
-| Method | BLEU | ROUGE-L | Fluency | Consistency | ACC |
-|---|---:|---:|---:|---:|---:|
-| Direct LLM | 10.14 | 23.75 | 75.8 | 69.3 | 55.28 |
-| Naive RAG | 17.38 | 24.06 | 77.0 | 69.7 | 77.39 |
-| LogicRAG w/o DFA | 17.32 | 26.11 | 72.7 | 69.7 | 74.67 |
-| **LogicRAG** | **18.82** | **27.23** | **77.1** | **70.5** | **92.30** |
+## Sample experiment
 
-Table 3: Generalization experiment results on the RotoWire dataset.
+The standard repository experiment learns from physical CSV rows 2 and 3 of `data/case_6115.csv`, corresponding to zero-based data indices 0 and 1.
 
----
+Build the DFA:
 
-## 5. Efficiency
+```text
+python autologic_client.py build --csv "data/case_6115.csv" --row-a 0 --row-b 1 --semantic-merge-threshold 0.5 --state-support-threshold 0.5 --transition-support-threshold 0.5 --condition-mode deepseek --local-embedding-only --chat-model "deepseek-chat" --temperature 0.1 --collection-id "nonferrous_weekly_case_6115" --dfa-id "autologic_case_6115" --output-root "autologic_outputs/experiment_6115/build" --force
+```
 
-We further analyze the offline construction time of LogicRAG and representative baselines across subsets of FinLDP-Bench. The efficiency gap between LogicRAG and other methods is moderate, and this trade-off is worthwhile because LogicRAG directly produces a complete report with stronger logic consistency and numerical accuracy.
+Generate the dated report:
 
-| Methods | Macro | Cotton | Precious Metals | ETF | Agriculture | Average |
-|---|---:|---:|---:|---:|---:|---:|
-| NaiveRAG | 9.76 | 5.06 | 4.73 | 6.36 | 7.58 | 6.70 |
-| HeteRAG | 33.17 | 17.19 | 16.09 | 21.64 | 25.78 | 22.77 |
-| CRAG | 18.54 | 9.61 | 8.99 | 12.09 | 14.41 | 12.73 |
-| GraphRAG | 112.20 | 58.64 | 54.90 | 73.82 | 88.30 | 77.57 |
-| LogicRAG | 97.57 | 50.56 | 47.32 | 63.64 | 75.82 | 66.98 |
+```text
+python autologic_client.py generate --dfa "autologic_outputs/experiment_6115/build/dfa.json" --query "请撰写一篇截至2025年2月28日的中文有色金属行业跟踪周报。尽量保持历史样本的章节组织、研究深度和信息密度；分品种跟踪沪铜、伦铜、沪铝、伦铝、沪金和COMEX黄金。结合当前状态可用证据分析价格变化、供给、需求、库存、宏观环境和主要驱动因素，并给出后市判断、配置建议与风险提示。只能使用检索证据和此前正文的压缩记忆；证据未提供的数值必须明确说明数据不足，不得估算或虚构。严格按照DFA逐状态生成当前章节，不提前撰写后续章节，也不预先决定完整写作路径。" --date "2025-02-28" --dictionary "domain_dictionary.csv" --chat-model "deepseek-chat" --temperature 0.1 --max-steps 50 --max-visits-per-state 2 --max-transition-repeats 2 --output-root "autologic_outputs/experiment_6115/live_report" --force
+```
 
-Table 4: Average offline time (in seconds) of LogicRAG and representative baselines across subsets of FinLDP-Bench.
+Final report:
 
----
+```text
+autologic_outputs/experiment_6115/live_report/generated_report.md
+```
 
-## 6. Implementation
+See [docs/EXPERIMENT_GUIDE.md](docs/EXPERIMENT_GUIDE.md) for prerequisites, dry-run execution, acceptance checks, and troubleshooting.
 
-This repository contains a runnable prototype of the LogicRAG pipeline:
+## State-level iFinD isolation
 
-- `document_learner.py`: extracts state sequences from sample reports and builds the global state template.
-- `query_processing.py`: matches a user query to the global state index and extracts a query-specific subtree.
-- `ifind_data_plugin.py`: retrieves market data from iFinD and binds it to state-level `required_materials`.
-- `report_generator.py`: generates the final report along the query-specific state order.
-- `logicrag_client.py`: provides a one-command client for the full pipeline.
+The resolver prioritizes the current `required_material`, then the current state's semantics, then an explicit single-asset fallback. Assets from a multi-asset query are not propagated to every material.
 
-The implementation supports OpenAI-compatible chat APIs, DashScope Bailian embeddings, and iFinD market-data retrieval.
+Quotation requests are split by code. If an overseas code fails because of subscription permissions while a domestic code succeeds, successful records are retained and the binding is marked `partial`. Per-code results are persisted in `evidence.bindings[].code_results`.
 
----
+Generic macro or supply-demand materials are not silently converted into unrelated futures quotation requests. Unsupported materials remain explicit as `unresolved`.
+
+## Runtime outputs
+
+Successful `demo`, `generate`, and `run` executions write:
+
+```text
+dfa.json
+generated_report.md
+generated_states.json
+execution_trace.json
+run_manifest.json
+```
+
+`generated_states.json` contains only actually visited states, ordered by step. `execution_trace.json` records candidates, selected symbols, evidence summaries, next states, fallbacks, and guards. `run_manifest.json` separates DFA completion from the detailed retrieval evidence stored per state.
+
+## Tests
+
+```text
+python -m compileall autologic
+python -m py_compile autologic_client.py ifind_data_plugin.py
+python -m unittest discover -s tests -p "test_autologic*.py" -v
+python -m unittest tests.test_ifind_data_plugin -v
+```
+
+The test suite is offline and does not require API keys or iFinD access.
+
+## MVP limitations
+
+- DFA construction is optimized for two homogeneous reports.
+- The bundled domain dictionary covers a limited set of instruments.
+- The current live backend retrieves historical quotations through `THS_HQ`; macro, inventory, industry-index, and specialized supply-demand evidence require additional backends.
+- The current live request uses a single date rather than a complete weekly interval.
+- Overseas instruments may require account-specific market-data permissions.
+- Arbitrary-N incremental clustering, multi-DFA selection, and query-specific path planning are outside the MVP.
 
 ## Citation
 
-If you find this work useful, please cite:
-
 ```bibtex
-@article{logicrag2026,
-  title={LogicRAG: A Logic-Driven Framework for Financial Document Generation with Retrieval-Augmented Generation},
+@article{autologic2026,
+  title={AutoLogic: Condition-Driven Automata for Financial Report Generation},
   author={Anonymous},
   year={2026}
 }
 ```
-
----
-
-## Experiment Guide
-
-Detailed experiment instructions, including API-key configuration, hyperparameters, dataset paths, and full execution commands, are provided in a separate folder:
-
-[docs/EXPERIMENT_GUIDE.md](docs/EXPERIMENT_GUIDE.md)

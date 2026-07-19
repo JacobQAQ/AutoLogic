@@ -329,12 +329,27 @@ class RequiredMaterialResolver:
             desc = str(node.get("content_guideline", ""))
             materials = [str(item).strip() for item in as_list(node.get("required_materials")) if str(item).strip()]
             for material in materials:
-                material_context = f"{query}\n{material}"
-                full_context = f"{query}\n{label}\n{desc}\n{material}"
-                codes, notes = self.resolve_codes(material_context, asset_name=asset_name)
+                state_context = f"{label}\n{desc}\n{material}"
+                codes, notes = self.resolve_codes(material)
+                if codes:
+                    notes.append("asset scope resolved from required_material")
                 if not codes:
-                    codes, notes = self.resolve_codes(full_context, asset_name=asset_name)
-                indicators = self.resolve_indicators(full_context)
+                    codes, notes = self.resolve_codes(state_context)
+                    if codes:
+                        notes.append("asset scope resolved from current state")
+                if not codes and asset_name:
+                    codes, notes = self.resolve_codes(material, asset_name=asset_name)
+                    if codes:
+                        notes.append("asset scope resolved from explicit asset_name")
+                if not codes:
+                    query_codes = self.dictionary.scan_codes(query)
+                    if len(query_codes) == 1:
+                        codes = query_codes
+                        notes = [
+                            "resolved by domain_dictionary.csv",
+                            "asset scope resolved from single-code query fallback",
+                        ]
+                indicators = self.resolve_indicators(state_context)
                 specs.append(
                     RetrievalSpec(
                         node_id=node_id,
@@ -467,18 +482,37 @@ def fetch_data_for_specs(
         status = "planned"
         error = ""
         records: List[Dict[str, Any]] = []
+        code_results: List[Dict[str, Any]] = []
 
         if not spec.codes:
             status = "unresolved"
             error = "No futures CODES resolved from query_subtree required_materials."
         elif not dry_run:
-            try:
-                df = client.cmd_history_quotation(spec.codes, spec.indicators, spec.date)
-                records = dataframe_records(df)
+            errors: List[str] = []
+            for code in unique_keep_order(spec.codes):
+                try:
+                    df = client.cmd_history_quotation([code], spec.indicators, spec.date)
+                    code_records = dataframe_records(df)
+                    records.extend(code_records)
+                    code_results.append(
+                        {
+                            "code": code,
+                            "status": "found" if code_records else "empty",
+                            "error": "",
+                            "record_count": len(code_records),
+                        }
+                    )
+                except Exception as exc:
+                    message = f"{code}: {exc}"
+                    errors.append(message)
+                    code_results.append(
+                        {"code": code, "status": "error", "error": str(exc), "record_count": 0}
+                    )
+            error = "; ".join(errors)
+            if errors:
+                status = "partial" if records else "error"
+            else:
                 status = "found" if records else "empty"
-            except Exception as exc:
-                status = "error"
-                error = str(exc)
 
         annotated_records = []
         for record in records:
@@ -504,6 +538,7 @@ def fetch_data_for_specs(
                 "error": error,
                 "records": records,
                 "raw_text": records_to_raw_text(records),
+                "code_results": code_results,
             }
         )
 

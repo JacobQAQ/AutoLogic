@@ -18,6 +18,7 @@ from .adapters import (
     StateEvidence,
 )
 from .models import WritingDFA, WritingState, WritingTransition
+from .validation import DFAValidationError
 
 
 class ExecutionError(RuntimeError):
@@ -129,6 +130,20 @@ def _numeric_direction(records: Sequence[dict[str, Any]]) -> int:
     return 0
 
 
+def _has_directional_observation(records: Sequence[dict[str, Any]]) -> bool:
+    preferred = {"changeratio", "change_ratio", "change", "chg_settlement", "change_settlement"}
+    for record in records:
+        for key, value in record.items():
+            if str(key).replace("%", "").casefold() not in preferred or isinstance(value, bool):
+                continue
+            try:
+                float(str(value).strip().rstrip("%"))
+                return True
+            except (TypeError, ValueError):
+                continue
+    return False
+
+
 def _text_direction(text: str) -> int:
     lowered = text.casefold()
     up_patterns = (
@@ -150,6 +165,13 @@ def _rank_transition(transition: WritingTransition) -> tuple[float, float, str, 
     return (-transition.support_count, -transition.confidence, transition.symbol, transition.target)
 
 
+@dataclass(frozen=True)
+class _EvidenceMatch:
+    transition: WritingTransition
+    score: int
+    reason: str
+
+
 class ConditionGrounder:
     """Ground one finite outgoing symbol without allowing target generation."""
 
@@ -166,31 +188,35 @@ class ConditionGrounder:
         return None
 
     @staticmethod
-    def _deterministic_decision(
+    def _evidence_matches(
         evidence: StateEvidence,
         generated_content: str,
         memory: str,
         outgoing: Sequence[WritingTransition],
-    ) -> ConditionDecision | None:
+    ) -> list[_EvidenceMatch]:
         by_symbol = {transition.symbol: transition for transition in outgoing}
+        matches: list[_EvidenceMatch] = []
         direction = _numeric_direction(evidence.records)
         reason_source = "structured current-state records"
         if direction == 0:
             direction = _text_direction(f"{evidence.summary}\n{generated_content}")
             reason_source = "current-state evidence summary and generated content"
         if direction > 0 and "PRICE_UP" in by_symbol:
-            return ConditionDecision("PRICE_UP", f"Positive price direction found in {reason_source}.", 1.0)
+            matches.append(
+                _EvidenceMatch(by_symbol["PRICE_UP"], 100, f"Positive price direction found in {reason_source}.")
+            )
         if direction < 0 and "PRICE_DOWN" in by_symbol:
-            return ConditionDecision("PRICE_DOWN", f"Negative price direction found in {reason_source}.", 1.0)
+            matches.append(
+                _EvidenceMatch(by_symbol["PRICE_DOWN"], 100, f"Negative price direction found in {reason_source}.")
+            )
 
         # For non-price conditions, look for meaningful condition words only in
         # current evidence/content. Memory is deliberately a secondary aid.
         current_text = f"{evidence.summary} {generated_content}".casefold()
         memory_text = memory.casefold()
-        scored: list[tuple[int, WritingTransition]] = []
         ignored = {
             "current", "evidence", "shows", "indicates", "that", "this", "state",
-            "condition", "the", "and", "with", "from", "data", "report",
+            "condition", "the", "and", "with", "from", "data", "report", "price",
         }
         for transition in outgoing:
             words = {
@@ -200,28 +226,68 @@ class ConditionGrounder:
             }
             score = sum(2 for word in words if word in current_text)
             score += sum(1 for word in words if word in memory_text)
-            if score:
-                scored.append((score, transition))
-        if scored:
-            scored.sort(key=lambda item: (-item[0], *_rank_transition(item[1])))
-            best = scored[0]
-            if len(scored) == 1 or best[0] > scored[1][0]:
-                return ConditionDecision(
-                    best[1].symbol,
-                    "Condition-description keywords are grounded in current evidence/content.",
-                    min(0.95, 0.55 + 0.1 * best[0]),
+            if score and not any(match.transition.symbol == transition.symbol for match in matches):
+                matches.append(
+                    _EvidenceMatch(
+                        transition,
+                        score,
+                        "Condition-description keywords are grounded in current evidence/content.",
+                    )
                 )
-        return None
+        return sorted(
+            matches,
+            key=lambda match: (-match.score, *_rank_transition(match.transition)),
+        )
 
     @staticmethod
-    def _fallback(outgoing: Sequence[WritingTransition], reason: str) -> ConditionDecision:
-        selected = sorted(outgoing, key=_rank_transition)[0]
+    def _explicit_no_match(evidence: StateEvidence, generated_content: str) -> bool:
+        if _has_directional_observation(evidence.records) and _numeric_direction(evidence.records) == 0:
+            return True
+        text = f"{evidence.summary}\n{generated_content}".casefold()
+        neutral_patterns = (
+            r"\bneutral\b",
+            r"\bflat\b",
+            r"\bunchanged\b",
+            r"\bno directional (?:signal|observation|evidence)\b",
+            r"中性",
+            r"持平",
+            r"无明确方向",
+        )
+        if any(re.search(pattern, text) for pattern in neutral_patterns):
+            return True
+        return evidence.status in {"unresolved", "empty", "error"} and not evidence.records
+
+    @staticmethod
+    def _no_match() -> ConditionDecision:
         return ConditionDecision(
-            symbol=selected.symbol,
-            reason="Classifier failed; selected the deterministic highest-support legal transition.",
-            confidence=selected.confidence,
+            symbol="NO_MATCH",
+            reason="No outgoing condition is factually satisfied by current evidence.",
+            confidence=1.0,
+            used_fallback=False,
+        )
+
+    @staticmethod
+    def _evidence_backed_fallback(matches: Sequence[_EvidenceMatch]) -> ConditionDecision:
+        selected = sorted(
+            matches,
+            key=lambda match: (-match.score, *_rank_transition(match.transition)),
+        )[0]
+        return ConditionDecision(
+            symbol=selected.transition.symbol,
+            reason=selected.reason,
+            confidence=selected.transition.confidence,
             used_fallback=True,
-            fallback_reason=reason,
+            fallback_reason="EVIDENCE_BACKED_CLASSIFIER_FALLBACK",
+        )
+
+    @staticmethod
+    def _classifier_error() -> ConditionDecision:
+        return ConditionDecision(
+            symbol=None,
+            reason="Condition classifier failed and no candidate had independent evidence support.",
+            confidence=0.0,
+            used_fallback=False,
+            fallback_reason="INVALID_CLASSIFIER_OUTPUT_AFTER_RETRY",
         )
 
     def ground_condition(
@@ -246,11 +312,28 @@ class ConditionGrounder:
                 1.0,
             )
 
-        deterministic = self._deterministic_decision(evidence, generated_content, memory, outgoing)
-        if deterministic is not None:
-            return deterministic
+        evidence_matches = self._evidence_matches(evidence, generated_content, memory, outgoing)
+
+        # A sole conditional edge is still grounded, but a deterministic fact
+        # may establish it without a classifier call.
+        if len(outgoing) == 1:
+            if evidence_matches:
+                match = evidence_matches[0]
+                return ConditionDecision(match.transition.symbol, match.reason, 1.0)
+            return self._no_match()
+
         if dry_run:
-            return self._fallback(outgoing, "DRY_RUN_NO_EXPLICIT_CONDITION_MATCH")
+            if not evidence_matches:
+                return self._no_match()
+            match = evidence_matches[0]
+            return ConditionDecision(
+                match.transition.symbol,
+                match.reason,
+                min(1.0, 0.55 + 0.01 * match.score),
+            )
+
+        if not evidence_matches and self._explicit_no_match(evidence, generated_content):
+            return self._no_match()
 
         candidates = [
             {"symbol": transition.symbol, "condition_description": transition.condition_description}
@@ -274,7 +357,6 @@ Current generated content:
 Bounded prior memory:
 {memory or "None."}
 """.strip()
-        errors: list[str] = []
         for attempt in range(2):
             try:
                 payload = self.chat.complete_json(
@@ -295,9 +377,11 @@ Bounded prior memory:
                 if not reason or not 0.0 <= confidence <= 1.0:
                     raise ValueError("Classifier reason/confidence is invalid.")
                 return ConditionDecision(symbol, reason, confidence, raw_response=json.dumps(payload, ensure_ascii=False))
-            except Exception as exc:
-                errors.append(f"attempt {attempt + 1}: {exc}")
-        return self._fallback(outgoing, "INVALID_CLASSIFIER_OUTPUT_AFTER_RETRY: " + " | ".join(errors))
+            except Exception:
+                continue
+        if evidence_matches:
+            return self._evidence_backed_fallback(evidence_matches)
+        return self._classifier_error()
 
 
 def ground_condition(
@@ -395,6 +479,45 @@ class AutoLogicExecutor:
             for item in outgoing
         ]
 
+    def _guard_trace(
+        self,
+        *,
+        step: int,
+        current: str,
+        status: str,
+        reason: str,
+        candidate_conditions: list[dict[str, Any]] | None = None,
+        selected_condition: str | None = None,
+        next_state: str | None = None,
+    ) -> dict[str, Any]:
+        state = self.dfa.states.get(current)
+        return {
+            "step": step,
+            "current_state": current,
+            "state_label": state.label if state else "",
+            "state_action": state.action if state else "",
+            "evidence_status": "not_evaluated",
+            "evidence_summary": "",
+            "generated_content": "",
+            "candidate_conditions": candidate_conditions or [],
+            "selected_condition": selected_condition,
+            "condition_reason": reason,
+            "condition_confidence": 0.0,
+            "next_state": next_state,
+            "used_fallback": False,
+            "fallback_reason": "",
+            "status": status,
+            "event_type": "guard",
+        }
+
+    def _validate_for_execution(self) -> None:
+        validation = self.dfa.validate()
+        runtime_controlled = {"REACHABLE_NONFINAL_SINK", "NO_REACHABLE_FINAL"}
+        blocking = [issue for issue in validation.errors if issue.code not in runtime_controlled]
+        if blocking:
+            details = "; ".join(f"{issue.code}: {issue.message}" for issue in blocking)
+            raise DFAValidationError(details)
+
     def execute(
         self,
         *,
@@ -404,8 +527,7 @@ class AutoLogicExecutor:
         dry_run: bool = False,
         output_dir: str | Path | None = None,
     ) -> ExecutionResult:
-        validation = self.dfa.validate()
-        validation.raise_if_invalid()
+        self._validate_for_execution()
         current = self.dfa.initial_state
         memory = CompactMemory()
         generated_states: list[dict[str, Any]] = []
@@ -420,16 +542,34 @@ class AutoLogicExecutor:
         try:
             while True:
                 if step >= self.max_steps:
-                    raise ExecutionGuardError(
-                        "MAX_STEPS", f"Execution exceeded max_steps={self.max_steps}."
+                    termination_reason = "MAX_STEPS"
+                    trace.append(
+                        self._guard_trace(
+                            step=step + 1,
+                            current=current,
+                            status=termination_reason,
+                            reason=f"Execution reached max_steps={self.max_steps}.",
+                        )
                     )
+                    success = False
+                    break
                 step += 1
                 visit_counts[current] += 1
                 if visit_counts[current] > self.max_visits_per_state:
-                    raise ExecutionGuardError(
-                        "MAX_VISITS_PER_STATE",
-                        f"State {current} exceeded max_visits_per_state={self.max_visits_per_state}.",
+                    termination_reason = "MAX_VISITS_PER_STATE"
+                    trace.append(
+                        self._guard_trace(
+                            step=step,
+                            current=current,
+                            status=termination_reason,
+                            reason=(
+                                f"State {current} exceeded "
+                                f"max_visits_per_state={self.max_visits_per_state}."
+                            ),
+                        )
                     )
+                    success = False
+                    break
 
                 state = self.dfa.states[current]
                 if state.state_kind == "terminal":
@@ -518,10 +658,11 @@ class AutoLogicExecutor:
                     success = True
                     break
                 if not outgoing:
-                    trace_record["condition_reason"] = "No outgoing transition is available."
+                    trace_record["status"] = "NON_FINAL_DEAD_END"
+                    trace_record["condition_reason"] = "A non-final state has no valid outgoing transition."
                     trace.append(trace_record)
-                    termination_reason = "NO_OUTGOING_TRANSITION"
-                    success = True
+                    termination_reason = "NON_FINAL_DEAD_END"
+                    success = False
                     break
 
                 decision = self.condition_grounder.ground_condition(
@@ -549,16 +690,36 @@ class AutoLogicExecutor:
                     success = False
                     break
                 if decision.symbol is None:
-                    raise ExecutionError(f"Condition grounding returned no symbol for non-final state {current}.")
+                    trace_record["status"] = "CONDITION_CLASSIFIER_ERROR"
+                    trace.append(trace_record)
+                    termination_reason = "CONDITION_CLASSIFIER_ERROR"
+                    success = False
+                    break
 
                 next_state = self.dfa.delta(current, decision.symbol)
                 edge = (current, decision.symbol, next_state)
                 transition_counts[edge] += 1
                 if transition_counts[edge] > self.max_transition_repeats:
-                    raise ExecutionGuardError(
-                        "MAX_TRANSITION_REPEATS",
-                        f"Transition {edge} exceeded max_transition_repeats={self.max_transition_repeats}.",
+                    trace_record["next_state"] = next_state
+                    trace_record["status"] = "TRANSITION_BLOCKED_BY_GUARD"
+                    trace.append(trace_record)
+                    termination_reason = "MAX_TRANSITION_REPEATS"
+                    trace.append(
+                        self._guard_trace(
+                            step=step,
+                            current=current,
+                            status=termination_reason,
+                            reason=(
+                                f"Transition {edge} exceeded "
+                                f"max_transition_repeats={self.max_transition_repeats}."
+                            ),
+                            candidate_conditions=self._candidate_payload(outgoing),
+                            selected_condition=decision.symbol,
+                            next_state=next_state,
+                        )
                     )
+                    success = False
+                    break
                 trace_record["next_state"] = next_state
                 trace.append(trace_record)
                 memory.update(state, content, evidence, decision)

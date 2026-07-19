@@ -5,12 +5,24 @@ __pycache__/
 
 # Runtime outputs
 logicrag_outputs*/
+/autologic_outputs/
 tmp_query_processing_test/
 generated_report.md
 generated_node_outputs.json
 generation_trace.json
 retrieved_materials/
 futures_data_*.csv
+/data.zip
+
+# Legacy LogicRAG assets kept locally but excluded from the AutoLogic repository tree.
+/LogicRAG.pdf
+/images/
+/check_dashscope_embedding.py
+/ifind_api_tool.py
+/logicrag_client.py
+/query_processing.py
+/data/*.csv
+!/data/case_6115.csv
 
 # Local datasets are kept outside source control by default.
 dataset/

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from autologic.adapters import (
     AutoLogicChatAdapter,
@@ -16,7 +21,6 @@ from autologic.executor import (
     AutoLogicExecutor,
     ConditionDecision,
     ConditionGrounder,
-    ExecutionGuardError,
 )
 from autologic.models import UndefinedTransitionError, WritingDFA, WritingState, WritingTransition
 
@@ -92,6 +96,22 @@ def linear_dfa() -> WritingDFA:
     )
 
 
+def single_conditional_dfa() -> WritingDFA:
+    first = state("S001", "market_review", initial=True)
+    final = state("S002", "bullish_analysis", final=True)
+    return WritingDFA(
+        states={first.state_id: first, final.state_id: final},
+        transitions=[
+            WritingTransition(
+                "S001", "PRICE_UP", "Current evidence shows that price is increasing.", "S002", 1, 0.9
+            )
+        ],
+        initial_state="S001",
+        final_states={"S002"},
+        metadata=metadata("S001", "S002"),
+    )
+
+
 def cycle_dfa() -> WritingDFA:
     first = state("S001", "cycle_a", initial=True)
     second = state("S002", "cycle_b")
@@ -112,33 +132,42 @@ def cycle_dfa() -> WritingDFA:
     )
 
 
-class FakeRetriever:
-    def __init__(self) -> None:
+class FixedEvidenceRetriever:
+    def __init__(
+        self,
+        change_ratio: float | None,
+        summary: str | None = None,
+        status: str = "found",
+    ) -> None:
+        self.change_ratio = change_ratio
+        self.summary = summary
+        self.status = status
         self.calls: list[str] = []
         self.closed = False
 
     def retrieve_state(self, state, query, date=None, dry_run=False, asset_name=None):
-        del asset_name
+        del query, asset_name
         self.calls.append(state.state_id)
-        lowered = query.casefold()
-        if "up" in lowered or "上涨" in lowered:
-            ratio = 1.5
-            summary = "Price increased and is 上涨."
-        elif "down" in lowered or "下跌" in lowered:
-            ratio = -1.5
-            summary = "Price decreased and is 下跌."
+        if self.summary is not None:
+            summary = self.summary
+        elif self.change_ratio is None:
+            summary = "Market observations are available."
+        elif self.change_ratio > 0:
+            summary = "Current records show a positive price change."
+        elif self.change_ratio < 0:
+            summary = "Current records show a negative price change."
         else:
-            ratio = 0.0
-            summary = "Direction is neutral and unspecified."
+            summary = "Current records are neutral with unchanged price."
+        records = [] if self.change_ratio is None else [{"changeRatio": self.change_ratio}]
         return StateEvidence(
             state_id=state.state_id,
             required_materials=list(state.required_materials),
             resolved_codes=["@GC0Y.CMX"],
             resolved_indicators=["changeRatio"],
             query_date=date or "2026-01-02",
-            records=[{"changeRatio": ratio}],
+            records=records,
             summary=summary,
-            status="planned" if dry_run else "found",
+            status="planned" if dry_run else self.status,
             is_mock=dry_run,
         )
 
@@ -256,46 +285,68 @@ class GroundConditionTests(unittest.TestCase):
         self.dfa = branching_dfa()
         self.state = self.dfa.states["S001"]
         self.outgoing = self.dfa.outgoing("S001")
-        self.neutral = StateEvidence(
-            "S001", [], [], [], "2026-01-02", [], "No directional observation.", "empty"
+        self.ambiguous = StateEvidence(
+            "S001", [], [], [], "2026-01-02", [], "Market observations are available.", "found"
+        )
+
+    @staticmethod
+    def positive_evidence() -> StateEvidence:
+        return StateEvidence(
+            "S001", [], [], [], "2026-01-02", [{"changeRatio": 1.5}],
+            "Current records show a positive price change.", "found"
         )
 
     def test_invalid_condition_first_attempt_retries(self) -> None:
         chat = SequenceJSONChat(
             [
                 {"symbol": "NOT_ALLOWED", "reason": "bad", "confidence": 0.5},
-                {"symbol": "PRICE_DOWN", "reason": "Validated on retry", "confidence": 0.8},
+                {"symbol": "PRICE_UP", "reason": "Validated on retry", "confidence": 0.8},
             ]
         )
         decision = ConditionGrounder(chat).ground_condition(
             state=self.state,
-            evidence=self.neutral,
-            generated_content="No directional observation.",
+            evidence=self.positive_evidence(),
+            generated_content="The current price change is positive.",
             memory="",
             outgoing_transitions=self.outgoing,
         )
-        self.assertEqual(decision.symbol, "PRICE_DOWN")
+        self.assertEqual(decision.symbol, "PRICE_UP")
         self.assertEqual(chat.calls, 2)
         self.assertFalse(decision.used_fallback)
 
-    def test_invalid_condition_falls_back_deterministically(self) -> None:
+    def test_invalid_condition_without_evidence_returns_classifier_error(self) -> None:
         chat = SequenceJSONChat([ValueError("bad-json"), {"symbol": "BAD", "reason": "bad", "confidence": 2}])
         decision = ConditionGrounder(chat).ground_condition(
             state=self.state,
-            evidence=self.neutral,
-            generated_content="No directional observation.",
+            evidence=self.ambiguous,
+            generated_content="Market observations are available.",
+            memory="",
+            outgoing_transitions=self.outgoing,
+        )
+        self.assertIsNone(decision.symbol)
+        self.assertFalse(decision.used_fallback)
+        self.assertEqual(decision.fallback_reason, "INVALID_CLASSIFIER_OUTPUT_AFTER_RETRY")
+
+    def test_invalid_classifier_uses_only_evidence_backed_fallback(self) -> None:
+        chat = SequenceJSONChat([ValueError("bad-json"), ValueError("bad-json-again")])
+        decision = ConditionGrounder(chat).ground_condition(
+            state=self.state,
+            evidence=self.positive_evidence(),
+            generated_content="The current price change is positive.",
             memory="",
             outgoing_transitions=self.outgoing,
         )
         self.assertEqual(decision.symbol, "PRICE_UP")
         self.assertTrue(decision.used_fallback)
-        self.assertIn("INVALID_CLASSIFIER_OUTPUT_AFTER_RETRY", decision.fallback_reason)
+        self.assertEqual(decision.fallback_reason, "EVIDENCE_BACKED_CLASSIFIER_FALLBACK")
 
 
 class ExecutorTests(unittest.TestCase):
     def execute(self, dfa, query, **kwargs):
-        retriever = kwargs.pop("retriever", FakeRetriever())
+        retriever = kwargs.pop("retriever", FixedEvidenceRetriever(0.0))
         generator = kwargs.pop("generator", FakeGenerator())
+        dry_run = kwargs.pop("dry_run", True)
+        output_dir = kwargs.pop("output_dir", None)
         executor = AutoLogicExecutor(
             dfa,
             evidence_retriever=retriever,
@@ -303,7 +354,16 @@ class ExecutorTests(unittest.TestCase):
             condition_grounder=kwargs.pop("grounder", ConditionGrounder(NetworkBombChat())),
             **kwargs,
         )
-        return executor.execute(query=query, date="2026-01-02", dry_run=True), retriever, generator
+        return (
+            executor.execute(
+                query=query,
+                date="2026-01-02",
+                dry_run=dry_run,
+                output_dir=output_dir,
+            ),
+            retriever,
+            generator,
+        )
 
     def test_single_unconditional_edge_is_selected_without_deepseek(self) -> None:
         result, retriever, _ = self.execute(linear_dfa(), "neutral")
@@ -313,15 +373,24 @@ class ExecutorTests(unittest.TestCase):
         self.assertTrue(retriever.closed)
 
     def test_price_up_and_price_down_take_different_paths(self) -> None:
-        up, _, _ = self.execute(branching_dfa(), "price up")
-        down, _, _ = self.execute(branching_dfa(), "price down")
+        query = "write the weekly market report for 2026-01-02"
+        up, _, _ = self.execute(
+            branching_dfa(), query, retriever=FixedEvidenceRetriever(1.5)
+        )
+        down, _, _ = self.execute(
+            branching_dfa(), query, retriever=FixedEvidenceRetriever(-1.5)
+        )
         self.assertEqual([item["state_id"] for item in up.generated_states], ["S001", "S002"])
         self.assertEqual([item["state_id"] for item in down.generated_states], ["S001", "S003"])
         self.assertEqual(up.execution_trace[0]["selected_condition"], "PRICE_UP")
         self.assertEqual(down.execution_trace[0]["selected_condition"], "PRICE_DOWN")
 
     def test_final_state_content_is_generated_and_report_has_only_actual_path(self) -> None:
-        result, _, _ = self.execute(branching_dfa(), "price up")
+        result, _, _ = self.execute(
+            branching_dfa(),
+            "write the weekly market report for 2026-01-02",
+            retriever=FixedEvidenceRetriever(1.5),
+        )
         self.assertIn("CONTENT:bullish_analysis", result.generated_report)
         self.assertNotIn("bearish_analysis", result.generated_report)
         self.assertEqual(result.run_manifest["termination_reason"], "FINAL_WRITING_STATE")
@@ -333,34 +402,83 @@ class ExecutorTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(len(result.generated_states), 1)
 
+    def test_non_final_dead_end_is_controlled_failure(self) -> None:
+        dead = state("S001", "dead_end", initial=True)
+        dfa = WritingDFA({"S001": dead}, [], "S001", set(), metadata("S001"))
+        result, _, _ = self.execute(dfa, "weekly report")
+        self.assertFalse(result.success)
+        self.assertEqual(result.run_manifest["termination_reason"], "NON_FINAL_DEAD_END")
+        self.assertEqual(result.execution_trace[-1]["status"], "NON_FINAL_DEAD_END")
+
     def test_undefined_delta_raises_clear_error(self) -> None:
         with self.assertRaises(UndefinedTransitionError):
             self.execute(branching_dfa(), "neutral", grounder=BadGrounder())
 
     def test_max_steps_guard(self) -> None:
-        with self.assertRaisesRegex(ExecutionGuardError, "MAX_STEPS"):
-            self.execute(
+        result, _, _ = self.execute(
+            cycle_dfa(),
+            "weekly report",
+            grounder=LoopGrounder(),
+            max_steps=2,
+            max_visits_per_state=10,
+            max_transition_repeats=10,
+        )
+        self.assertFalse(result.success)
+        self.assertEqual(result.run_manifest["termination_reason"], "MAX_STEPS")
+        self.assertTrue(result.generated_states)
+        self.assertTrue(result.generated_report)
+        self.assertEqual(result.execution_trace[-1]["status"], "MAX_STEPS")
+
+    def test_max_visits_per_state_guard(self) -> None:
+        result, _, _ = self.execute(
+            cycle_dfa(),
+            "weekly report",
+            grounder=LoopGrounder(),
+            max_steps=10,
+            max_visits_per_state=1,
+            max_transition_repeats=10,
+        )
+        self.assertFalse(result.success)
+        self.assertEqual(result.run_manifest["termination_reason"], "MAX_VISITS_PER_STATE")
+        self.assertTrue(result.generated_states)
+
+    def test_max_transition_repeats_guard(self) -> None:
+        result, _, _ = self.execute(
+            cycle_dfa(),
+            "weekly report",
+            grounder=LoopGrounder(),
+            max_steps=10,
+            max_visits_per_state=10,
+            max_transition_repeats=1,
+        )
+        self.assertFalse(result.success)
+        self.assertEqual(result.run_manifest["termination_reason"], "MAX_TRANSITION_REPEATS")
+        self.assertTrue(result.generated_states)
+
+    def test_guard_with_output_dir_saves_partial_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result, _, _ = self.execute(
                 cycle_dfa(),
-                "neutral",
+                "weekly report",
                 grounder=LoopGrounder(),
                 max_steps=2,
                 max_visits_per_state=10,
                 max_transition_repeats=10,
+                output_dir=directory,
             )
-
-    def test_max_visits_per_state_guard(self) -> None:
-        with self.assertRaisesRegex(ExecutionGuardError, "MAX_VISITS_PER_STATE"):
-            self.execute(
-                cycle_dfa(),
-                "neutral",
-                grounder=LoopGrounder(),
-                max_steps=10,
-                max_visits_per_state=1,
-                max_transition_repeats=10,
-            )
+            self.assertFalse(result.success)
+            for filename in (
+                "generated_report.md", "generated_states.json", "execution_trace.json", "run_manifest.json"
+            ):
+                self.assertTrue((Path(directory) / filename).exists())
+            manifest = json.loads((Path(directory) / "run_manifest.json").read_text(encoding="utf-8"))
+            self.assertFalse(manifest["success"])
+            self.assertEqual(manifest["termination_reason"], "MAX_STEPS")
 
     def test_execution_trace_fields_and_saved_outputs(self) -> None:
-        result, _, _ = self.execute(branching_dfa(), "price down")
+        result, _, _ = self.execute(
+            branching_dfa(), "weekly report", retriever=FixedEvidenceRetriever(-1.5)
+        )
         required = {
             "step", "current_state", "state_label", "state_action", "evidence_status",
             "evidence_summary", "generated_content", "candidate_conditions", "selected_condition",
@@ -374,7 +492,7 @@ class ExecutorTests(unittest.TestCase):
             self.assertEqual([item["state_id"] for item in states_payload], ["S001", "S003"])
 
     def test_dry_run_generator_never_calls_deepseek(self) -> None:
-        retriever = FakeRetriever()
+        retriever = FixedEvidenceRetriever(1.5)
         generator = StateContentGenerator(chat=NetworkBombChat())
         executor = AutoLogicExecutor(
             branching_dfa(),
@@ -382,27 +500,67 @@ class ExecutorTests(unittest.TestCase):
             content_generator=generator,
             condition_grounder=ConditionGrounder(NetworkBombChat()),
         )
-        result = executor.execute(query="price up", date="2026-01-02", dry_run=True)
+        result = executor.execute(
+            query="write the weekly market report for 2026-01-02",
+            date="2026-01-02",
+            dry_run=True,
+        )
         self.assertTrue(result.success)
         self.assertIn("PRICE_UP", result.generated_report)
 
     def test_no_match_stops_at_implicit_rejection_without_forcing_branch(self) -> None:
-        retriever = FakeRetriever()
+        retriever = FixedEvidenceRetriever(0.0)
         generator = FakeGenerator()
-        chat = SequenceJSONChat(
-            [{"symbol": "NO_MATCH", "reason": "Neither price condition is satisfied.", "confidence": 0.9}]
-        )
         executor = AutoLogicExecutor(
             branching_dfa(),
             evidence_retriever=retriever,
             content_generator=generator,
-            condition_grounder=ConditionGrounder(chat),
+            condition_grounder=ConditionGrounder(NetworkBombChat()),
         )
-        result = executor.execute(query="neutral", date="2026-01-02", dry_run=False)
+        result = executor.execute(
+            query="write the weekly market report for 2026-01-02",
+            date="2026-01-02",
+            dry_run=True,
+        )
         self.assertFalse(result.success)
         self.assertEqual(result.run_manifest["termination_reason"], "CONDITION_NOT_SATISFIED")
         self.assertEqual(result.execution_trace[-1]["next_state"], "s_bottom")
+        self.assertEqual(result.execution_trace[-1]["selected_condition"], "NO_MATCH")
         self.assertEqual([item["state_id"] for item in result.generated_states], ["S001"])
+
+    def test_single_conditional_edge_requires_supporting_evidence(self) -> None:
+        query = "write the weekly market report for 2026-01-02"
+        positive, _, _ = self.execute(
+            single_conditional_dfa(), query, retriever=FixedEvidenceRetriever(1.5)
+        )
+        neutral, _, _ = self.execute(
+            single_conditional_dfa(), query, retriever=FixedEvidenceRetriever(0.0)
+        )
+        negative, _, _ = self.execute(
+            single_conditional_dfa(), query, retriever=FixedEvidenceRetriever(-1.5)
+        )
+        self.assertEqual([item["state_id"] for item in positive.generated_states], ["S001", "S002"])
+        for result in (neutral, negative):
+            self.assertFalse(result.success)
+            self.assertEqual(result.execution_trace[-1]["selected_condition"], "NO_MATCH")
+            self.assertEqual(result.run_manifest["termination_reason"], "CONDITION_NOT_SATISFIED")
+
+    def test_classifier_failure_without_evidence_is_controlled(self) -> None:
+        retriever = FixedEvidenceRetriever(None, "Market observations are available.")
+        chat = SequenceJSONChat([ValueError("bad-json"), ValueError("bad-json-again")])
+        executor = AutoLogicExecutor(
+            branching_dfa(),
+            evidence_retriever=retriever,
+            content_generator=FakeGenerator(),
+            condition_grounder=ConditionGrounder(chat),
+        )
+        result = executor.execute(query="weekly report", date="2026-01-02", dry_run=False)
+        self.assertFalse(result.success)
+        self.assertEqual(result.run_manifest["termination_reason"], "CONDITION_CLASSIFIER_ERROR")
+        self.assertIsNone(result.execution_trace[-1]["selected_condition"])
+        self.assertEqual(
+            result.execution_trace[-1]["fallback_reason"], "INVALID_CLASSIFIER_OUTPUT_AFTER_RETRY"
+        )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.0",
+  "description": "Offline fixture evidence used only by the AutoLogic demo command.",
+  "query": "Write the weekly market report for 2026-01-02.",
+  "query_date": "2026-01-02",
+  "scenarios": {
+    "price-up": {
+      "state_evidence": {
+        "S002": {
+          "records": [{"code": "DEMO.GOLD", "settlement": 2685.0, "changeRatio": 1.5}],
+          "summary": "Fixture evidence shows price increased by 1.5 percent."
+        }
+      }
+    },
+    "price-down": {
+      "state_evidence": {
+        "S002": {
+          "records": [{"code": "DEMO.GOLD", "settlement": 2605.0, "changeRatio": -1.5}],
+          "summary": "Fixture evidence shows price decreased by 1.5 percent."
+        }
+      }
+    }
+  }
+}
